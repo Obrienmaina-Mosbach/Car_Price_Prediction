@@ -1,0 +1,8 @@
+
+# Environment variables file
+env
+
+#Model files
+*.model
+*.joblib
+.csv
