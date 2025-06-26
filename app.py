@@ -4,32 +4,55 @@ import numpy as np
 import joblib
 import os
 import datetime
-import sklearn
+import sklearn # To check version compatibility
 
 # --- Global paths for model and assets ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Paths for the main model and final preprocessing components
 MODEL_PATH = os.path.join(BASE_DIR, 'tuned_xgboost_car_price_model_selected_features.pkl')
-SCALER_PATH = os.path.join(BASE_DIR, 'scaler.joblib')
+SCALER_PATH = os.path.join(BASE_DIR, 'scaler.joblib') # This is your main scaler for the final X
 SELECTED_FEATURES_PATH = os.path.join(BASE_DIR, 'selected_features.joblib')
-FULL_OHE_COLUMNS_PATH = os.path.join(BASE_DIR, 'original_training_cols.joblib')
-UNIQUE_VALUES_PATH = os.path.join(BASE_DIR, 'unique_values.joblib') # New path for unique values
+FULL_OHE_COLUMNS_PATH = os.path.join(BASE_DIR, 'original_training_cols.joblib') # All OHE columns AFTER Cluster_X added
+UNIQUE_VALUES_PATH = os.path.join(BASE_DIR, 'unique_values.joblib')
+
+# Paths for PCA and KMeans specific assets
+SCALER_PCA_KMEANS_PATH = os.path.join(BASE_DIR, 'scaler_pca_kmeans.joblib')
+PCA_MODEL_PATH = os.path.join(BASE_DIR, 'pca_model.joblib')
+KMEANS_MODEL_PATH = os.path.join(BASE_DIR, 'kmeans_model.joblib')
+# Base training columns used for PCA and KMeans
+BASE_TRAINING_COLS_PCA_KMEANS_PATH = os.path.join(BASE_DIR, 'base_training_cols_for_pca_kmeans.joblib')
 
 
-EXPECTED_SKLEARN_VERSION = '1.7.0' # Updated to 1.7.0
+# --- Scikit-learn version compatibility check ---
+# Adjust this to the version you used for training if it's different
+# Remember to verify this version in your training environment!
+EXPECTED_SKLEARN_VERSION = '1.7.0' # Changed back to a common stable version, please verify
+
 if sklearn.__version__ != EXPECTED_SKLEARN_VERSION:
     st.warning(f"Scikit-learn version {sklearn.__version__} detected, but model was trained with {EXPECTED_SKLEARN_VERSION}. Compatibility issues may arise.")
+
 
 # --- Function to load model and assets ---
 @st.cache_resource # Cache the model loading for performance
 def load_assets():
-    """Loads the trained model, scaler, selected features, full OHE columns, and unique values for dropdowns."""
+    """Loads the trained model, scalers, PCA, KMeans, selected features, full OHE columns, and unique values."""
     try:
         model = joblib.load(MODEL_PATH)
-        scaler = joblib.load(SCALER_PATH)
+        scaler = joblib.load(SCALER_PATH) # Main scaler
         selected_features = joblib.load(SELECTED_FEATURES_PATH)
         full_ohe_columns = joblib.load(FULL_OHE_COLUMNS_PATH)
-        unique_values = joblib.load(UNIQUE_VALUES_PATH) # Load the unique values dictionary
-        return model, scaler, selected_features, full_ohe_columns, unique_values
+        unique_values = joblib.load(UNIQUE_VALUES_PATH)
+
+        # Load PCA and KMeans assets
+        scaler_pca_kmeans = joblib.load(SCALER_PCA_KMEANS_PATH)
+        pca_model = joblib.load(PCA_MODEL_PATH)
+        kmeans_model = joblib.load(KMEANS_MODEL_PATH)
+        base_training_cols_for_pca_kmeans = joblib.load(BASE_TRAINING_COLS_PCA_KMEANS_PATH)
+
+
+        return model, scaler, selected_features, full_ohe_columns, unique_values, \
+            scaler_pca_kmeans, pca_model, kmeans_model, base_training_cols_for_pca_kmeans
     except FileNotFoundError as e:
         st.error(f"Error loading assets. Ensure all .joblib files are in the same directory as app.py: {e}")
         st.stop()
@@ -38,13 +61,17 @@ def load_assets():
         st.stop()
 
 
-model, scaler, selected_features, full_ohe_columns, unique_values = load_assets()
+# Unpack all loaded assets
+model, scaler, selected_features, full_ohe_columns, unique_values, \
+    scaler_pca_kmeans, pca_model, kmeans_model, base_training_cols_for_pca_kmeans = load_assets()
+
 
 # --- Preprocessing function for new input data ---
-def preprocess_input(input_df, full_ohe_columns, scaler, selected_features, unique_values):
+def preprocess_input(input_df, full_ohe_columns, scaler, selected_features, unique_values,
+                     scaler_pca_kmeans, pca_model, kmeans_model, base_training_cols_for_pca_kmeans):
     """
     Preprocesses a single row of input data for prediction.
-    Maps unseen categorical values to defaults, applies OHE, scales, and selects features.
+    Maps unseen categorical values to defaults, applies OHE, PCA, KMeans, scales, and selects features.
     """
     # Define categorical columns as they were in your training script
     categorical_cols = [
@@ -52,51 +79,75 @@ def preprocess_input(input_df, full_ohe_columns, scaler, selected_features, uniq
         'Exterior_Color', 'Interior_Material', 'Interior_Color',
         'Location', 'BodyType', 'DriveType', 'FuelType'
     ]
+    numerical_features = [ # Not strictly used in this function for direct manipulation but good for reference
+        'Year', 'Kilometres', 'CylindersinEngine', 'Doors', 'Seats', 'FuelConsumption',
+        'Engine_Cylinders', 'Engine_Liters'
+    ]
 
-    # Map unseen categorical values to defaults from unique_values
+    # Make a copy to avoid modifying the original input_df (important for session state)
+    df_processed = input_df.copy()
+
+    # 1. Handle categorical features: map unseen values and convert to categorical type
     for col in categorical_cols:
-        if col in input_df.columns:
-            # Get the list of known unique values for this column from the training data
+        if col in df_processed.columns:
             known_values = unique_values.get(col, [])
-            # Get the default value for unseen categories, falling back to 'Other' or 'Unknown'
             default_val = unique_values.get(f"{col}_default", None)
 
-            if default_val is None: # Fallback for default_val if not explicitly set in unique_values
+            # Fallback for default_val if not explicitly set in unique_values
+            if default_val is None:
                 if col == 'Model':
                     default_val = 'Other_Model'
                 elif col in ['Exterior_Color', 'Interior_Material', 'Interior_Color']:
                     default_val = 'Other/Unknown'
                 else:
-                    default_val = known_values[0] if known_values else 'Unknown' # Fallback to first known or 'Unknown'
+                    default_val = known_values[0] if known_values else 'Unknown'
 
             # Apply mapping: if value is not known, replace with default_val
-            input_df[col] = input_df[col].apply(lambda x: x if x in known_values else default_val)
-
-            # Ensure categories are unique by converting to a set and back to list
-            # This is crucial for pd.Categorical to avoid "Categorical categories must be unique" error
-            all_possible_categories = list(set(known_values + [default_val]))
-
+            df_processed[col] = df_processed[col].apply(lambda x: x if x in known_values else default_val)
 
             # Convert to 'category' dtype with known categories to prevent issues during get_dummies
-            input_df[col] = pd.Categorical(input_df[col], categories=all_possible_categories)
+            # Ensure all_possible_categories includes the default_val for robustness
+            all_possible_categories = list(set(known_values + [default_val]))
+            df_processed[col] = pd.Categorical(df_processed[col], categories=all_possible_categories)
 
+    # 2. Apply initial one-hot encoding for base categorical features
+    df_encoded_initial = pd.get_dummies(df_processed, columns=categorical_cols, drop_first=True, dummy_na=False)
 
-    # Apply one-hot encoding
-    # `handle_unknown='ignore'` is vital here to prevent errors for unseen categories in production
-    input_encoded = pd.get_dummies(input_df, columns=categorical_cols, drop_first=True, dummy_na=False)
+    # 3. Align columns for PCA/KMeans processing
+    X_for_pca_kmeans_processing = df_encoded_initial.reindex(columns=base_training_cols_for_pca_kmeans, fill_value=0)
 
+    # 4. Scale data for PCA and KMeans
+    X_scaled_for_pca_kmeans_processed = scaler_pca_kmeans.transform(X_for_pca_kmeans_processing)
 
-    # Reindex the input_encoded DataFrame to match the full_ohe_columns from training
-    # This ensures all columns are present (with 0 if not in input) and in the correct order
-    X_processed = input_encoded.reindex(columns=full_ohe_columns, fill_value=0)
+    # 5. Apply PCA transformation
+    X_pca_processed = pca_model.transform(X_scaled_for_pca_kmeans_processed)
 
-    # Apply scaling to the entire X_processed DataFrame
-    # The scaler was fitted on X_train (which contained all OHE features and numerical features)
-    X_scaled_full = scaler.transform(X_processed)
+    # 6. Predict KMeans cluster label
+    cluster_label_processed = kmeans_model.predict(X_pca_processed)[0] # [0] because it's a single row
 
-    # Select features based on the model's selected features from the scaled full set
-    # Ensure the output of scaler.transform is converted back to DataFrame for column selection
+    # 7. Add one-hot encoded cluster features
+    cluster_columns_all = [f'Cluster_{i}' for i in range(kmeans_model.n_clusters)]
+    cluster_columns_ohe = []
+    if kmeans_model.n_clusters > 1:
+        cluster_columns_ohe = [col for col in cluster_columns_all if col != 'Cluster_0']
+
+    cluster_df = pd.DataFrame(0, index=df_processed.index, columns=cluster_columns_ohe)
+
+    if cluster_label_processed != 0 and f'Cluster_{cluster_label_processed}' in cluster_columns_ohe:
+        cluster_df[f'Cluster_{cluster_label_processed}'] = 1
+
+    # 8. Combine initial OHE features with new cluster OHE features
+    final_df_before_main_scale = pd.concat([df_encoded_initial, cluster_df], axis=1)
+
+    # 9. Reindex the combined DataFrame to match the full_ohe_columns from training
+    x_processed = final_df_before_main_scale.reindex(columns=full_ohe_columns, fill_value=0)
+
+    # 10. Apply the MAIN scaler to the entire x_processed DataFrame
+    X_scaled_full = scaler.transform(x_processed)
+
+    # 11. Select features based on the model's selected features from the scaled full set
     X_final = pd.DataFrame(X_scaled_full, columns=full_ohe_columns)[selected_features]
+
     return X_final
 
 # --- Streamlit App UI ---
@@ -145,25 +196,24 @@ h1, h2 {
     text-align: center;
 }
 .title-font {
-    font-size: 2.5em; /* Default for h1, can adjust */
+    font-size: 2.5em;
     font-weight: bold;
-    color: #2e4a6b; /* Ensure color consistency */
+    color: #2e4a6b;
     text-align: center;
 }
 .subtitle-font {
-    font-size: 1.7em; /* As requested by user */
+    font-size: 1.7em;
     text-align: center;
-    color: #555; /* A slightly lighter color for subtitle */
-    margin-top: -10px; /* Pull it closer to the title */
+    color: #555;
+    margin-top: -10px;
 }
 </style>
 """, unsafe_allow_html=True)
 
 # Add an image at the top of the app
-# Updated use_column_width to use_container_width
 st.image("Assets/Images/img_1.png",
          caption="Let's predict the price of your car!",
-         use_container_width=True) # Changed from use_column_width
+         use_container_width=True)
 
 st.title("Car Price Predictor")
 st.write("Enter the car details to get a predicted price!")
@@ -177,42 +227,62 @@ if 'form_data' not in st.session_state:
     st.session_state.form_data = {}
 
 # --- Input Fields ---
+st.header("Car Specifications")
+
+# Brand - MOVED OUTSIDE THE FORM
+unique_brands = sorted(unique_values.get('Brand', []))
+# Update session state with the selected brand whenever it changes
+brand = st.selectbox(
+    "Brand",
+    unique_brands,
+    index=unique_brands.index(st.session_state.form_data.get('brand', unique_brands[0] if unique_brands else 'Other')) if st.session_state.form_data.get('brand') in unique_brands else 0,
+    key='brand_select', # Use a different key here to avoid conflict with 'brand' in form_data
+    on_change=lambda: st.session_state.form_data.update({'brand': st.session_state.brand_select, 'model': None}) # Reset model when brand changes
+)
+# Make sure the session_state['brand'] reflects the actual selection from the selectbox
+st.session_state.form_data['brand'] = brand
+
+
+# Model (filtered by Brand) - MOVED OUTSIDE THE FORM LOGIC, but within the form container
+@st.cache_data
+def get_models_for_brand(selected_brand):
+    brand_models = unique_values.get('Model_by_Brand', {}).get(selected_brand, [])
+    if 'Other_Model' in unique_values.get('Model', []):
+        if 'Other_Model' not in brand_models:
+            brand_models.append('Other_Model')
+    return sorted(list(set(brand_models)))
+
+models = get_models_for_brand(brand)
+
+# Determine the default model to display
+model_default_val = st.session_state.form_data.get('model')
+if model_default_val not in models:
+    # If the previously selected model is not in the new brand's models,
+    # or if no model was previously selected, default to the first available model
+    # or 'Other_Model' if available.
+    if models:
+        model_default_val = models[0]
+        if 'Other_Model' in models:
+            model_default_val = 'Other_Model'
+    else:
+        model_default_val = 'Other_Model' # Fallback if no models are available
+
+model_index = models.index(model_default_val) if model_default_val in models else 0
+model_input = st.selectbox("Model", models, index=model_index, key='model_select')
+st.session_state.form_data['model'] = model_input # Update session state
+
+
+# --- Remaining input fields inside the form ---
 with st.form("car_prediction_form"):
-    st.header("Car Specifications")
+    # The variables 'brand' and 'model_input' are already defined above this form block
+    # so they can be directly used here without re-declaring them inside the form.
 
-    # Brand
-    unique_brands = sorted(unique_values.get('Brand', []))
-    # Ensure a default is always available for index if unique_brands is empty or default is not in it
-    brand_default_val = st.session_state.form_data.get('brand', unique_brands[0] if unique_brands else 'Other')
-    brand_index = unique_brands.index(brand_default_val) if brand_default_val in unique_brands else 0
-    brand = st.selectbox("Brand", unique_brands, index=brand_index, key='brand')
-
-    # Model (filtered by Brand)
-    @st.cache_data
-    def get_models_for_brand(selected_brand):
-        # Fetch models specific to the selected brand, falling back to 'Other_Model' if none found
-        brand_models = unique_values.get('Model_by_Brand', {}).get(selected_brand, [])
-        # Ensure 'Other_Model' is always an option if it was used in training for low cardinality models
-        if 'Other_Model' in unique_values.get('Model', []): # Check if 'Other_Model' was a category in training
-            if 'Other_Model' not in brand_models:
-                brand_models.append('Other_Model')
-
-        return sorted(list(set(brand_models))) # Ensure uniqueness and sort
-
-    models = get_models_for_brand(brand)
-    # Ensure model_default is a valid choice in `models`
-    model_default_val = st.session_state.form_data.get('model', models[0] if models else 'Other_Model')
-    model_index = models.index(model_default_val) if model_default_val in models else (models.index('Other_Model') if 'Other_Model' in models else 0)
-    model_input = st.selectbox("Model", models, index=model_index, key='model')
-
-
-    # Changed to 3 columns
     col1, col2, col3 = st.columns(3)
     with col1:
         current_year = datetime.datetime.now().year
         year = st.number_input("Year", min_value=1950, max_value=current_year, value=st.session_state.form_data.get('year', 2015), step=1, key='year')
         kilometres = st.number_input("Kilometres", min_value=0, max_value=500000, value=st.session_state.form_data.get('kilometres', 50000), step=1000, key='kilometres')
-        cylinders_options = sorted(unique_values.get('Engine_Cylinders', [4, 6, 8, 3, 5, 10, 12, 16])) # Fallback options
+        cylinders_options = sorted(unique_values.get('Engine_Cylinders', [4, 6, 8, 3, 5, 10, 12, 16]))
         cylinders_default_val = st.session_state.form_data.get('cylinders', 4)
         cylinders_index = cylinders_options.index(cylinders_default_val) if cylinders_default_val in cylinders_options else 0
         cylinders = st.selectbox("Engine Cylinders", cylinders_options, index=cylinders_index, key='cylinders')
@@ -244,7 +314,7 @@ with st.form("car_prediction_form"):
         used_or_new = st.selectbox("Condition", used_or_new_options, index=used_or_new_index, key='used_or_new')
 
 
-    col4, col5, col6 = st.columns(3) # New set of columns for the rest of the inputs
+    col4, col5, col6 = st.columns(3)
     with col4:
         location_options = sorted(unique_values.get('Location', []))
         location_default_val = st.session_state.form_data.get('location', location_options[0] if location_options else 'NSW')
@@ -288,15 +358,19 @@ with st.form("car_prediction_form"):
 
     if submitted:
         # Store current form data in session state for persistence
-        st.session_state.form_data = {
-            'brand': brand, 'model': model_input, 'year': year, 'kilometres': kilometres,
+        # Note: brand and model_input are already updated outside the form logic,
+        # but storing them here ensures all data is captured consistently on submit.
+        st.session_state.form_data.update({
+            'brand': brand,
+            'model': model_input,
+            'year': year, 'kilometres': kilometres,
             'cylinders': cylinders, 'doors': doors, 'seats': seats,
             'fuel_consumption': fuel_consumption, 'engine_liters': engine_liters,
             'transmission': transmission, 'used_or_new': used_or_new,
             'location': location, 'body_type': body_type, 'drive_type': drive_type,
             'fuel_type': fuel_type, 'exterior_color': exterior_color,
             'interior_material': interior_material, 'interior_color': interior_color
-        }
+        })
 
         # Input validation
         if year > current_year:
@@ -331,8 +405,8 @@ with st.form("car_prediction_form"):
 
         # Preprocess and predict
         try:
-            # Pass unique_values to preprocess_input
-            processed_input = preprocess_input(input_df.copy(), full_ohe_columns, scaler, selected_features, unique_values)
+            processed_input = preprocess_input(input_df.copy(), full_ohe_columns, scaler, selected_features, unique_values,
+                                               scaler_pca_kmeans, pca_model, kmeans_model, base_training_cols_for_pca_kmeans)
             predicted_price = model.predict(processed_input)[0]
 
             # Convert AUD to EUR (approximate conversion rate)
@@ -343,9 +417,9 @@ with st.form("car_prediction_form"):
 
             st.markdown(f"""
             <div class="prediction-box">
-                Predicted Car Price: **€{formatted_eur_price}**
+                Predicted Car Price: €{formatted_eur_price}
             </div>
             """, unsafe_allow_html=True)
         except Exception as e:
             st.error(f"An error occurred during prediction. Please check your inputs. Error: {e}")
-
+            st.exception(e) # Show the full exception for debugging
